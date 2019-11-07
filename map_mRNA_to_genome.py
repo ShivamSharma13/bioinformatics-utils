@@ -12,10 +12,15 @@ This script uses NCBI mRNAs and maps that mRNA's exon coordinates to the genome 
 from hit_entrez import get_ncbi_data
 import os
 import sys
+import re
 
 
-gencode_file_path = '../../data/gencode/gencode.v32.chr_patch_hapl_scaff.annotation.gff3'
+gencode_file = '../../data/gencode/gencode.v32.chr_patch_hapl_scaff.annotation.gff3'
 mirwalk_data_file = '../../data/miRNA-mRNA-targets/miRWalk/hsa_miRWalk_3UTR.txt'
+ncbi_annotation_file = '../../data/ncbi/ref_GRCh38.p12_top_level.gff3'
+
+chromosome_identification_table = {}
+
 
 def get_nm_ids_from_mirwalk_db(mirwalk_data_file):
 	#Check if a temporary file with the results of this function already exists.
@@ -60,6 +65,7 @@ def get_nm_ids_from_mirwalk_db(mirwalk_data_file):
 
 	return list(nm_like_ids.keys())
 
+
 def make_dict_from_gencode_file(gencode_file_path):
 	#Output dictionary.
 	transcript_to_exonic_coordinates = {}
@@ -95,7 +101,7 @@ def make_dict_from_gencode_file(gencode_file_path):
 				sys.stdout.write("\033[F")
 			values = line.split('\t')
 			
-			#Check if the data seems to be intact.
+			#Check if the a particular entry is intact.
 			if len(values) == 9:
 
 				#Check if type of entry is exon.
@@ -134,6 +140,78 @@ def make_dict_from_gencode_file(gencode_file_path):
 	return transcript_to_exonic_coordinates
 
 
+def make_dict_from_ncbi_annotation(ncbi_annotation_file_path):
+	#A fucntion to parse the NCBI annotation file and yield a dictionary for downstream intersection.
+	#Functionality of gencode parser wasn't used becuase the metadata was organized differently for both the files.
+	#Because of this, this function and the gencode parser function are very similar; redundancy.
+	
+	#Output dictionary.
+	nm_like_id_to_exomic_coordinates = {}
+
+	ncbi_tmp_annotation_file_name = '_tmp_' + ncbi_annotation_file_path.split('/')[-1]
+	if ncbi_tmp_annotation_file_name in os.listdir():
+		
+
+		return nm_like_id_to_exomic_coordinates
+
+	ncbi_annotation_indices = {'chr': 0, 'type': 2, 'start': 3, 'stop': 4, 'meta_data': 8}	
+	exon_count = None
+
+
+	#Open the annotation file and create a temporary file to write the parsed results.
+	with open(ncbi_annotation_file_path, 'r') as f, open(ncbi_tmp_annotation_file_name, 'w') as w:
+		for idx, line in enumerate(f):
+			if line.startswith('#'):
+				continue
+			if idx % 1000 == 0:
+				print(idx, " lines processed.")
+				sys.stdout.write("\033[F")
+			values = line.rstrip('\n').split('\t')
+			'''
+			An element of values (list) looks like:
+			['NC_000001.11', 'BestRefSeq', 'mRNA', '19644173', '19658456', '.', '+', '.', 
+			'ID=rna1988;Parent=gene589;Dbxref=GeneID:4681,Genbank:NM_005380.7,HGNC:HGNC:7650,MIM:600613;Name=NM_005380.7;
+			gbkey=mRNA;gene=NBL1;product=neuroblastoma 1%2C DAN family BMP antagonist%2C transcript variant 2;transcript_id=NM_005380.7']
+			'''		
+
+			#Check if an entry is intact.
+			if len(values) == 9:
+
+				#Check if the entry is for an exon.
+				if values[ncbi_annotation_indices['type']] == 'exon':
+					#NCBI provides an NC_*** like id instead of chr**, so extracting that through another function. 
+					chromosome = get_info_for_chromosomes(values[ncbi_annotation_indices['chr']])
+
+					if not chromosome:
+						continue
+
+					chromosome_start = values[ncbi_annotation_indices['start']]
+					chromosome_stop = values[ncbi_annotation_indices['stop']]
+
+					meta_data = values[ncbi_annotation_indices['meta_data']]
+
+					#Get all the meta data into a list for filtering.
+					_transcript_id_entry = meta_data.split(';')[-1]
+					transcript_id = _transcript_id_entry.split('=')[-1]
+
+					#Select entries starting with NM_ only.
+					if not transcript_id.startswith('NM'):
+						continue
+					
+					#Store the entry into a dictionary.
+					#See if this transcript_id doesn't already have an entry in the ..._exomic_coordinate dictionary.
+					if transcript_id not in nm_like_id_to_exomic_coordinates:
+						nm_like_id_to_exomic_coordinates[transcript_id] = []
+					
+					exon_count = nm_like_id_to_exomic_coordinates[transcript_id][-1][-1] + 1 if len(nm_like_id_to_exomic_coordinates[transcript_id]) > 0 else 1
+					nm_like_id_to_exomic_coordinates[transcript_id].append([chromosome, chromosome_start, chromosome_stop, exon_count])
+
+					#Also store the information into a file.
+					write_line = [chromosome, chromosome_start, chromosome_stop, transcript_id, str(exon_count)]
+					w.write('\t'.join(write_line)+'\n')
+
+	return nm_like_id_to_exomic_coordinates
+
 
 def get_exon_coordinates_from_ncbi(parsed_data):
 	try:
@@ -164,23 +242,74 @@ def get_exon_coordinates_from_ncbi(parsed_data):
 	return exons
 
 
+def get_info_for_chromosomes(nc_like_id):
+	#If record is already there then just return that.
+	if nc_like_id in chromosome_identification_table:
+		return chromosome_identification_table[nc_like_id]
+
+	#Record is not there, let's create it.
+	#Fetching data from ncbi.
+	#print("Hitting ncbi to get information for {}".format(nc_like_id))
+	
+
+	#Special case for X and Y.
+	if nc_like_id == 'NC_000023.11':
+		chromosome_identification_table[nc_like_id] = 'chrX'
+	elif nc_like_id == 'NC_000024.10':
+		chromosome_identification_table[nc_like_id] = 'chrY'
+	
+	ncbi_data = get_ncbi_data("nucleotide", nc_like_id)
+	gen_bank_definition = ncbi_data['GBSeq_definition']
+
+	try:
+		chromosome_info = re.search("chromosome\ \d+", gen_bank_definition).span()
+
+		#Extract the chromosome number from the definition.
+		chromosome_number = gen_bank_definition[chromosome_info[0]:chromosome_info[1]].split(' ')[-1]
+
+		chromosome_identification_table[nc_like_id] = 'chr' + chromosome_number
+
+		return chromosome_identification_table[nc_like_id]
+	except AttributeError:
+		print("No information on chromosome found for {}".format(nc_like_id))
+		chromosome_identification_table[nc_like_id] = False
+		return False
+	
+	return chromosome_identification_table[nc_like_id]
+
+
 if __name__ == "__main__":
 	#Get data from miRWalk.
 	example_database = "nucleotide"
 	example_ids = ["NM_001126116", "NM_000546"]
-	
+
+	if '_tmp_nc_id_reference.txt' in os.listdir():
+		print("Preparing chromosome identification table")
+		with open('_tmp_nc_id_reference.txt', 'r') as f:
+			for line in f:
+				chromosome_identification_table[line.split('\t')[0].rstrip('\n')] = line.split('\t')[1].rstrip('\n')
+
 	print("Processing miRWalk file, this might take a while...")
-	nm_like_ids = get_nm_ids_from_mirwalk_db(mirwalk_data_file)
+	#############miRWalk File Map#############
+	#mirwalk_nm_like_ids = get_nm_ids_from_mirwalk_db(mirwalk_data_file)
 
-	print("Processing Gencode file, this might take a while as well...")
-	gencode_annotations = make_dict_from_gencode_file(gencode_file_path)
 
-	print(gencode_annotations)
+	print("Processing Gencode file, this might take a while as well...")	
+	#############Gencode File Map#############
+	#gencode_annotations = make_dict_from_gencode_file(gencode_file)
 
-	for nm_like_id in example_ids:
-		ncbi_parsed_data = get_ncbi_data(example_database, example_ids[1])
+	
+	print("Processing NCBI annotation file, this might take a while as well...")
+	#############NCBI annotation File Map#############
+	#nm_like_id_to_exomic_coordinates = make_dict_from_ncbi_annotation(ncbi_annotation_file)
 
-		exons = get_exon_coordinates_from_ncbi(ncbi_parsed_data)
+	#Dump the chromosome reference table.
+	'''
+	Commented out for precaution.
+	if '_tmp_nc_id_reference.txt' not in os.listdir():
+		with open('_tmp_nc_id_reference.txt', 'w') as f:
+			for key, val in chromosome_identification_table.items():
+				f.write(str(key) + '\t' + str(val) + '\n')
+	'''
+	print("Job done, Bye.")
 
-		#print(exons)
-		break
